@@ -11,6 +11,8 @@ import android.os.ServiceManager
 import android.telephony.SubscriptionInfo
 import android.util.Log
 import io.github.vvb2060.ims.model.SimSelection
+import io.github.vvb2060.ims.model.ApnDraftConfig
+import io.github.vvb2060.ims.privileged.ApnModifier
 import io.github.vvb2060.ims.privileged.BrokerInstrumentation
 import io.github.vvb2060.ims.privileged.CaptivePortalFixer
 import io.github.vvb2060.ims.privileged.ConfigReader
@@ -188,6 +190,30 @@ class ShizukuProvider : ShizukuProvider() {
                 null
             } else {
                 result.getString(CaptivePortalFixer.BUNDLE_RESULT_MSG) ?: "unknown error"
+            }
+        }
+
+        suspend fun applyApnConfig(
+            context: Context,
+            subId: Int,
+            config: ApnDraftConfig,
+        ): String? {
+            val args = Bundle().apply {
+                putInt(ApnModifier.BUNDLE_SELECT_SIM_ID, subId)
+                putString(ApnModifier.BUNDLE_NAME, config.name)
+                putString(ApnModifier.BUNDLE_APN, config.apn)
+                putString(ApnModifier.BUNDLE_TYPE, config.type)
+                putString(ApnModifier.BUNDLE_MCC, config.mcc)
+                putString(ApnModifier.BUNDLE_MNC, config.mnc)
+            }
+            val result = startInstrumentation(context, ApnModifier::class.java, args, true)
+            if (result == null) {
+                return "failed with empty result"
+            }
+            return if (result.getBoolean(ApnModifier.BUNDLE_RESULT)) {
+                null
+            } else {
+                result.getString(ApnModifier.BUNDLE_RESULT_MSG) ?: "unknown error"
             }
         }
 

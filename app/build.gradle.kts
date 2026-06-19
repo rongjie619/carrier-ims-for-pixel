@@ -24,6 +24,25 @@ val gitVersionName: String =
         )
     }.standardOutput.asText.get().trim()
 val appVersionName: String = libs.versions.app.version.get()
+val debugApplicationIdSuffix: String =
+    providers.gradleProperty("turboims.debugApplicationIdSuffix")
+        .orElse(providers.environmentVariable("TURBOIMS_DEBUG_APPLICATION_ID_SUFFIX"))
+        .orElse("")
+        .get()
+
+fun buildConfigString(value: String): String {
+    val escaped = value
+        .replace("\\", "\\\\")
+        .replace("\"", "\\\"")
+    return "\"$escaped\""
+}
+
+fun configuredString(propertyName: String, environmentName: String, defaultValue: String = ""): String {
+    return providers.gradleProperty(propertyName)
+        .orElse(providers.environmentVariable(environmentName))
+        .orElse(defaultValue)
+        .get()
+}
 
 kotlin {
     compilerOptions {
@@ -44,6 +63,55 @@ android {
         targetSdk = libs.versions.android.targetSdk.get().toInt()
         versionCode = gitVersionCode
         versionName = appVersionName
+        buildConfigField(
+            "String",
+            "AD_API_BASE_URL",
+            buildConfigString(
+                configuredString(
+                    "turboims.adApiBaseUrl",
+                    "TURBOIMS_AD_API_BASE_URL",
+                    "https://leads.3jiezhiwai.com"
+                )
+            )
+        )
+        buildConfigField(
+            "String",
+            "DODOPAY_SUPPORT_URL_TEMPLATE",
+            buildConfigString(configuredString("turboims.dodopaySupportUrlTemplate", "TURBOIMS_DODOPAY_SUPPORT_URL_TEMPLATE"))
+        )
+        buildConfigField(
+            "String",
+            "BUSINESS_INTENT_BASE_URL",
+            buildConfigString(
+                configuredString(
+                    "turboims.businessIntentBaseUrl",
+                    "TURBOIMS_BUSINESS_INTENT_BASE_URL",
+                    "https://leads.3jiezhiwai.com"
+                )
+            )
+        )
+        buildConfigField(
+            "String",
+            "BUSINESS_CONTACT_TEXT",
+            buildConfigString(
+                configuredString(
+                    "turboims.businessContactText",
+                    "TURBOIMS_BUSINESS_CONTACT_TEXT",
+                    "合作联系：GitHub Issue"
+                )
+            )
+        )
+        buildConfigField(
+            "String",
+            "BUSINESS_CONTACT_URL",
+            buildConfigString(
+                configuredString(
+                    "turboims.businessContactUrl",
+                    "TURBOIMS_BUSINESS_CONTACT_URL",
+                    "https://github.com/ryfineZ/carrier-ims-for-pixel/issues/new"
+                )
+            )
+        )
         ndk {
             abiFilters.add("arm64-v8a")
         }
@@ -63,6 +131,9 @@ android {
             @Suppress("UnstableApiUsage")
             vcsInfo.include = false
             versionNameSuffix = ".d$gitVersionCode.$gitVersionName"
+            if (debugApplicationIdSuffix.isNotBlank()) {
+                applicationIdSuffix = debugApplicationIdSuffix
+            }
             signingConfig = signingConfigs.getByName("sign")
         }
         release {
@@ -114,6 +185,9 @@ dependencies {
     implementation(libs.material.icons.extended)
     implementation(libs.androidx.splashscreen)
     implementation(libs.lifecycle.viewmodel.ktx)
+
+    testImplementation(kotlin("test"))
+    testImplementation(libs.org.json)
 }
 
 apply(from = rootProject.file("signing.gradle"))

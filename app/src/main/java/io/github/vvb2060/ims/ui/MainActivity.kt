@@ -1,10 +1,10 @@
 package io.github.vvb2060.ims.ui
 
+import android.annotation.SuppressLint
 import android.app.DownloadManager
 import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.ClipboardManager
-import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -15,10 +15,11 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.Settings
-import android.provider.MediaStore
+import android.webkit.WebResourceRequest
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.widget.Toast
 import androidx.activity.viewModels
-import androidx.annotation.DrawableRes
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Column
@@ -65,7 +66,8 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.LocalMinimumInteractiveComponentEnforcement
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
@@ -79,6 +81,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -86,6 +89,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -103,6 +107,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.FileProvider
 import androidx.core.net.toUri
@@ -113,8 +119,15 @@ import io.github.vvb2060.ims.UpdateApkCleanup
 import io.github.vvb2060.ims.model.Feature
 import io.github.vvb2060.ims.model.FeatureValue
 import io.github.vvb2060.ims.model.FeatureValueType
+import io.github.vvb2060.ims.model.AdPlacement
+import io.github.vvb2060.ims.model.ApnDraftConfig
+import io.github.vvb2060.ims.model.BusinessIntentType
+import io.github.vvb2060.ims.model.CommercialAd
+import io.github.vvb2060.ims.model.ConfigBackupSnapshot
+import io.github.vvb2060.ims.model.NetworkExitStatus
 import io.github.vvb2060.ims.model.ShizukuStatus
 import io.github.vvb2060.ims.model.SimSelection
+import io.github.vvb2060.ims.model.SupportRules
 import io.github.vvb2060.ims.model.SystemInfo
 import io.github.vvb2060.ims.privileged.ImsModifier
 import io.github.vvb2060.ims.viewmodel.MainViewModel
@@ -125,8 +138,10 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
+import java.text.SimpleDateFormat
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.Date
 import java.util.Locale
 
 private const val COUNTRY_ISO_OPTION_DEFAULT = "__default__"
@@ -142,12 +157,6 @@ private val RELEASES_LATEST_API_URLS = listOf(
 )
 private const val UPDATE_APK_MIME_TYPE = "application/vnd.android.package-archive"
 private const val UNKNOWN_INSTALLER_SOURCE_SETTINGS_SCHEME = "package:"
-private const val WECHAT_PACKAGE_NAME = "com.tencent.mm"
-private const val ALIPAY_PACKAGE_NAME = "com.eg.android.AlipayGphone"
-private const val ALIPAY_DONATION_URL = "https://qr.alipay.com/2m610390t3ynw5ypko3li1b"
-private const val ALIPAY_SCAN_QR_ACTIVITY =
-    "com.alipay.mobile.quinox.splash.ShareScanQRDispenseActivity"
-private const val DONATION_QR_MIME_TYPE = "image/png"
 private val VERSION_DISPLAY_WITH_REV_REGEX = Regex("""\d+\.\d+\.\d+\.[rd]\d+""")
 private val VERSION_DISPLAY_REGEX = Regex("""\d+\.\d+\.\d+""")
 
@@ -162,11 +171,6 @@ private data class UpdateDialogState(
     val latest: ReleaseInfo,
 )
 
-private data class SavedDonationQr(
-    val uri: Uri,
-    val path: String,
-)
-
 private data class CountryIsoOption(
     val key: String,
     val isoCode: String?,
@@ -174,10 +178,26 @@ private data class CountryIsoOption(
     val labelRes: Int,
 )
 
+private sealed interface RemoteAdImageState {
+    data object Loading : RemoteAdImageState
+    data object Failed : RemoteAdImageState
+    data class Ready(val bitmap: Bitmap) : RemoteAdImageState
+}
+
 private enum class CaptivePortalAction {
     FIX,
     RESTORE,
     NONE,
+}
+
+private enum class MainTab(
+    val labelRes: Int,
+) {
+    IMS(R.string.tab_ims),
+    EXTRA(R.string.tab_extra),
+    SUPPORT(R.string.tab_support),
+    COOPERATION(R.string.tab_cooperation),
+    ABOUT(R.string.tab_about),
 }
 
 private val countryIsoOptions = listOf(
@@ -374,6 +394,7 @@ class MainActivity : BaseActivity() {
         val clipboardManager = context.getSystemService(ClipboardManager::class.java)
 
         val scope = rememberCoroutineScope()
+        var selectedTab by remember { mutableStateOf(MainTab.IMS) }
         var selectedSim by remember { mutableStateOf<SimSelection?>(null) }
         var showShizukuUpdateDialog by remember { mutableStateOf(false) }
         var pendingAutoSelectSimAfterReady by remember { mutableStateOf(false) }
@@ -387,11 +408,20 @@ class MainActivity : BaseActivity() {
         var checkingCaptivePortalStatus by remember { mutableStateOf(false) }
         var captivePortalFixState by remember { mutableStateOf<MainViewModel.CaptivePortalFixState?>(null) }
         var updateDialogState by remember { mutableStateOf<UpdateDialogState?>(null) }
-        var showDonationSheet by remember { mutableStateOf(false) }
-        var donationFeedbackMessage by remember { mutableStateOf<String?>(null) }
         var showDiagnosticsDialog by remember { mutableStateOf(false) }
         var diagnosticsRunning by remember { mutableStateOf(false) }
         var diagnosticsJob by remember { mutableStateOf<Job?>(null) }
+        var networkExitChecking by remember { mutableStateOf(false) }
+        var networkExitStatus by remember { mutableStateOf<NetworkExitStatus?>(null) }
+        var networkExitError by remember { mutableStateOf<String?>(null) }
+        var commercialAds by remember { mutableStateOf<List<CommercialAd>>(emptyList()) }
+        var homeAdToShow by remember { mutableStateOf<CommercialAd?>(null) }
+        var supportPaymentUrl by remember { mutableStateOf<String?>(null) }
+        var apnDraft by remember { mutableStateOf<ApnDraftConfig?>(null) }
+        var applyingApn by remember { mutableStateOf(false) }
+        var submittingBusinessIntent by remember { mutableStateOf(false) }
+        var configBackups by remember { mutableStateOf<List<ConfigBackupSnapshot>>(emptyList()) }
+        var pendingBackupRestore by remember { mutableStateOf<ConfigBackupSnapshot?>(null) }
         val diagnosticsLines = remember { mutableStateListOf<String>() }
         val featureSwitches = remember { mutableStateMapOf<Feature, FeatureValue>() }
         val committedFeatureSwitches = remember { mutableStateMapOf<Feature, FeatureValue>() }
@@ -438,6 +468,14 @@ class MainActivity : BaseActivity() {
             val release = result.getOrNull()
             hasUpdateAvailable = release != null && isVersionNewer(release.version, currentVersion)
             latestAvailableVersion = if (hasUpdateAvailable) release?.version else null
+        }
+        LaunchedEffect(Unit) {
+            configBackups = viewModel.loadConfigBackups()
+            commercialAds = viewModel.fetchCommercialAds().getOrDefault(emptyList())
+            homeAdToShow = commercialAds.firstOrNull {
+                it.placement == AdPlacement.HOME_POPUP && viewModel.shouldShowHomeAd(it)
+            }
+            homeAdToShow?.let { viewModel.markHomeAdShown(it) }
         }
         LaunchedEffect(allSimList) {
             val validSubIds = allSimList.filter { it.subId >= 0 }.map { it.subId }.toSet()
@@ -519,10 +557,142 @@ class MainActivity : BaseActivity() {
             }
         }
 
+        val handleFeatureSwitchChange: (Feature, FeatureValue) -> Unit = handleFeatureSwitchChange@{ feature, value ->
+            when (feature.valueType) {
+                FeatureValueType.STRING -> {
+                    featureSwitches[feature] = value
+                }
+
+                FeatureValueType.BOOLEAN -> {
+                    val sim = selectedSim
+                    val previousUiValue = featureSwitches[feature] ?: defaultFeatureValue(feature)
+                    val previousCommittedValue =
+                        committedFeatureSwitches[feature] ?: defaultFeatureValue(feature)
+                    featureSwitches[feature] = value
+                    committedFeatureSwitches[feature] = value
+                    if (applyingConfiguration) {
+                        featureSwitches[feature] = previousUiValue
+                        committedFeatureSwitches[feature] = previousCommittedValue
+                        return@handleFeatureSwitchChange
+                    }
+                    if (sim == null || shizukuStatus != ShizukuStatus.READY) {
+                        featureSwitches[feature] = previousUiValue
+                        committedFeatureSwitches[feature] = previousCommittedValue
+                        Toast.makeText(
+                            context,
+                            R.string.shizuku_not_running_msg,
+                            Toast.LENGTH_LONG
+                        ).show()
+                        return@handleFeatureSwitchChange
+                    }
+                    scope.launch {
+                        applyingConfiguration = true
+                        try {
+                            val resultMsg = viewModel.onApplyConfiguration(
+                                sim,
+                                buildCompleteFeatureMap(committedFeatureSwitches),
+                                countryMccOverride = sim.subId
+                                    .takeIf { it >= 0 }
+                                    ?.let { countryMccDraftBySubId[it].orEmpty() }
+                            )
+                            if (resultMsg != null) {
+                                if ((value.data as? Boolean) == true) {
+                                    viewModel.appendSwitchFailureLog(
+                                        action = feature.name,
+                                        subId = sim.subId.takeIf { it >= 0 },
+                                        stage = "apply_switch_enable",
+                                        backendMessage = resultMsg
+                                    )
+                                }
+                                featureSwitches[feature] = previousUiValue
+                                committedFeatureSwitches[feature] = previousCommittedValue
+                                Toast.makeText(
+                                    context,
+                                    context.getString(R.string.config_failed, resultMsg),
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            }
+                        } finally {
+                            applyingConfiguration = false
+                        }
+                    }
+                }
+            }
+        }
+
+        val restoreBackupAction = restoreBackup@{ backup: ConfigBackupSnapshot, allowMismatch: Boolean ->
+            val sim = selectedSim
+            if (sim == null || sim.subId < 0) {
+                Toast.makeText(context, R.string.select_single_sim, Toast.LENGTH_SHORT).show()
+                return@restoreBackup
+            }
+            if (shizukuStatus != ShizukuStatus.READY) {
+                Toast.makeText(context, R.string.shizuku_not_running_msg, Toast.LENGTH_LONG).show()
+                return@restoreBackup
+            }
+            if (!allowMismatch &&
+                SupportRules.requiresBackupMismatchConfirmation(backup, sim.mcc, sim.mnc)
+            ) {
+                pendingBackupRestore = backup
+                return@restoreBackup
+            }
+            scope.launch {
+                applyingConfiguration = true
+                try {
+                    val resultMsg = viewModel.onApplyConfiguration(
+                        sim,
+                        buildCompleteFeatureMap(backup.featureValues),
+                        countryMccOverride = backup.countryMccOverride,
+                    )
+                    if (resultMsg == null) {
+                        syncFeatureState(committedFeatureSwitches, backup.featureValues)
+                        syncFeatureState(featureSwitches, backup.featureValues)
+                        countryMccDraftBySubId[sim.subId] = backup.countryMccOverride
+                        committedCountryMccBySubId[sim.subId] = backup.countryMccOverride
+                        countryIsoApplySignalBySubId[sim.subId] =
+                            (countryIsoApplySignalBySubId[sim.subId] ?: 0) + 1
+                        Toast.makeText(context, R.string.config_backup_restored, Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(
+                            context,
+                            context.getString(R.string.config_failed, resultMsg),
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                } finally {
+                    applyingConfiguration = false
+                }
+            }
+        }
+
         Scaffold(
             modifier = Modifier
                 .fillMaxSize(),
             contentWindowInsets = WindowInsets(0.dp),
+            bottomBar = {
+                NavigationBar {
+                    MainTab.entries.forEach { tab ->
+                        NavigationBarItem(
+                            selected = selectedTab == tab,
+                            onClick = { selectedTab = tab },
+                            icon = {
+                                Text(
+                                    text = when (tab) {
+                                        MainTab.IMS -> "IMS"
+                                        MainTab.EXTRA -> "+"
+                                        MainTab.SUPPORT -> "$"
+                                        MainTab.COOPERATION -> "AD"
+                                        MainTab.ABOUT -> "i"
+                                    },
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            },
+                            label = { Text(stringResource(tab.labelRes), fontSize = 11.sp) }
+                        )
+                    }
+                }
+            },
         ) { innerPadding ->
             Column(
                 modifier = Modifier
@@ -531,80 +701,106 @@ class MainActivity : BaseActivity() {
                     .statusBarsPadding()
                     .verticalScroll(rememberScrollState())
             ) {
-                SystemInfoCard(
-                    systemInfo,
-                    shizukuStatus,
-                    onRefresh = {
-                        viewModel.updateShizukuStatus()
-                        if (shizukuStatus == ShizukuStatus.READY) {
-                            scope.launch {
-                                val hasValidSim = viewModel.refreshSimListNow()
-                                val messageRes = if (hasValidSim) {
-                                    R.string.sim_list_refresh
-                                } else {
-                                    R.string.sim_list_refresh_failed_restart_shizuku
+                if (selectedTab == MainTab.IMS) {
+                    HomeStatusCard(
+                        shizukuStatus = shizukuStatus,
+                        onRefresh = {
+                            viewModel.updateShizukuStatus()
+                            if (shizukuStatus == ShizukuStatus.READY) {
+                                scope.launch {
+                                    val hasValidSim = viewModel.refreshSimListNow()
+                                    val messageRes = if (hasValidSim) {
+                                        R.string.sim_list_refresh
+                                    } else {
+                                        R.string.sim_list_refresh_failed_restart_shizuku
+                                    }
+                                    val duration = if (hasValidSim) Toast.LENGTH_SHORT else Toast.LENGTH_LONG
+                                    Toast.makeText(context, messageRes, duration).show()
                                 }
-                                val duration = if (hasValidSim) Toast.LENGTH_SHORT else Toast.LENGTH_LONG
-                                Toast.makeText(context, messageRes, duration).show()
                             }
-                        }
-                    },
-                    onRequestShizukuPermission = {
-                        viewModel.requestShizukuPermission(0)
-                    },
-                    hasUpdateAvailable = hasUpdateAvailable,
-                    latestAvailableVersion = latestAvailableVersion,
-                    onLogcatClick = {
-                        startActivity(
-                            Intent(
-                                this@MainActivity,
-                                LogcatActivity::class.java
+                        },
+                        onRequestShizukuPermission = {
+                            viewModel.requestShizukuPermission(0)
+                        },
+                    )
+                }
+                if (selectedTab == MainTab.ABOUT) {
+                    SystemInfoCard(
+                        systemInfo,
+                        shizukuStatus,
+                        onRefresh = {
+                            viewModel.updateShizukuStatus()
+                            if (shizukuStatus == ShizukuStatus.READY) {
+                                scope.launch {
+                                    val hasValidSim = viewModel.refreshSimListNow()
+                                    val messageRes = if (hasValidSim) {
+                                        R.string.sim_list_refresh
+                                    } else {
+                                        R.string.sim_list_refresh_failed_restart_shizuku
+                                    }
+                                    val duration = if (hasValidSim) Toast.LENGTH_SHORT else Toast.LENGTH_LONG
+                                    Toast.makeText(context, messageRes, duration).show()
+                                }
+                            }
+                        },
+                        onRequestShizukuPermission = {
+                            viewModel.requestShizukuPermission(0)
+                        },
+                        hasUpdateAvailable = hasUpdateAvailable,
+                        latestAvailableVersion = latestAvailableVersion,
+                        onLogcatClick = {
+                            startActivity(
+                                Intent(
+                                    this@MainActivity,
+                                    LogcatActivity::class.java
+                                )
                             )
-                        )
-                    },
-                    checkingUpdate = checkingUpdate,
-                    onCheckUpdate = {
-                        if (checkingUpdate) return@SystemInfoCard
-                        scope.launch {
-                            checkingUpdate = true
-                            Toast.makeText(context, R.string.update_checking, Toast.LENGTH_SHORT).show()
-                            val currentVersion = BuildConfig.VERSION_NAME
-                            val result = fetchLatestReleaseInfo()
-                            checkingUpdate = false
-                            val release = result.getOrNull()
-                            if (release == null) {
-                                hasUpdateAvailable = false
-                                latestAvailableVersion = null
-                                Toast.makeText(
-                                    context,
-                                    this@MainActivity.getString(
-                                        R.string.update_check_failed,
-                                        result.exceptionOrNull()?.message ?: "unknown error"
-                                    ),
-                                    Toast.LENGTH_LONG
-                                ).show()
-                                return@launch
+                        },
+                        checkingUpdate = checkingUpdate,
+                        onCheckUpdate = {
+                            if (checkingUpdate) return@SystemInfoCard
+                            scope.launch {
+                                checkingUpdate = true
+                                Toast.makeText(context, R.string.update_checking, Toast.LENGTH_SHORT).show()
+                                val currentVersion = BuildConfig.VERSION_NAME
+                                val result = fetchLatestReleaseInfo()
+                                checkingUpdate = false
+                                val release = result.getOrNull()
+                                if (release == null) {
+                                    hasUpdateAvailable = false
+                                    latestAvailableVersion = null
+                                    Toast.makeText(
+                                        context,
+                                        this@MainActivity.getString(
+                                            R.string.update_check_failed,
+                                            result.exceptionOrNull()?.message ?: "unknown error"
+                                        ),
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                    return@launch
+                                }
+                                if (!isVersionNewer(release.version, currentVersion)) {
+                                    hasUpdateAvailable = false
+                                    latestAvailableVersion = null
+                                    Toast.makeText(context, R.string.update_latest, Toast.LENGTH_SHORT).show()
+                                    return@launch
+                                }
+                                hasUpdateAvailable = true
+                                latestAvailableVersion = release.version
+                                updateDialogState = UpdateDialogState(
+                                    currentVersion = currentVersion,
+                                    latest = release
+                                )
                             }
-                            if (!isVersionNewer(release.version, currentVersion)) {
-                                hasUpdateAvailable = false
-                                latestAvailableVersion = null
-                                Toast.makeText(context, R.string.update_latest, Toast.LENGTH_SHORT).show()
-                                return@launch
-                            }
-                            hasUpdateAvailable = true
-                            latestAvailableVersion = release.version
-                            updateDialogState = UpdateDialogState(
-                                currentVersion = currentVersion,
-                                latest = release
-                            )
-                        }
-                    },
-                    onIssueClick = submitIssueAction,
-                    onDonateClick = {
-                        showDonationSheet = true
-                    },
-                )
-                CaptivePortalFixCard(
+                        },
+                        onIssueClick = submitIssueAction,
+                        onDonateClick = {
+                            selectedTab = MainTab.SUPPORT
+                        },
+                        showDonateButton = false,
+                    )
+                }
+                if (selectedTab == MainTab.EXTRA) CaptivePortalFixCard(
                     shizukuStatus = shizukuStatus,
                     checkingCaptivePortalStatus = checkingCaptivePortalStatus,
                     fixingCaptivePortal = fixingCaptivePortal,
@@ -659,7 +855,7 @@ class MainActivity : BaseActivity() {
                         }
                     }
                 )
-                if (shizukuStatus == ShizukuStatus.READY) {
+                if (selectedTab == MainTab.IMS && shizukuStatus == ShizukuStatus.READY) {
                     SimCardSelectionCard(selectedSim, allSimList, onSelectSim = {
                         selectedSim = it
                     }, onRefreshSimList = {
@@ -715,10 +911,11 @@ class MainActivity : BaseActivity() {
                                         R.string.ims_register_apply_then_register,
                                         Toast.LENGTH_SHORT
                                     ).show()
-                                    val applyResultMsg = viewModel.onApplyConfiguration(
-                                        sim,
-                                        buildCompleteFeatureMap(committedFeatureSwitches)
-                                    )
+                                        val applyResultMsg = viewModel.onApplyConfiguration(
+                                            sim,
+                                            buildCompleteFeatureMap(committedFeatureSwitches),
+                                            countryMccOverride = countryMccDraftBySubId[sim.subId].orEmpty()
+                                        )
                                     if (applyResultMsg != null) {
                                         viewModel.appendSwitchFailureLog(
                                             action = "IMS_REGISTER",
@@ -767,66 +964,8 @@ class MainActivity : BaseActivity() {
                                 ?.takeIf { it >= 0 }
                                 ?.let { countryMccDraftBySubId[it] = newMcc }
                         },
-                        onFeatureSwitchChange = { feature, value ->
-                            when (feature.valueType) {
-                                FeatureValueType.STRING -> {
-                                    featureSwitches[feature] = value
-                                }
-
-                                FeatureValueType.BOOLEAN -> {
-                                    val sim = selectedSim
-                                    val previousUiValue =
-                                        featureSwitches[feature] ?: defaultFeatureValue(feature)
-                                    val previousCommittedValue =
-                                        committedFeatureSwitches[feature] ?: defaultFeatureValue(feature)
-                                    featureSwitches[feature] = value
-                                    committedFeatureSwitches[feature] = value
-                                    if (applyingConfiguration) {
-                                        featureSwitches[feature] = previousUiValue
-                                        committedFeatureSwitches[feature] = previousCommittedValue
-                                        return@FeaturesCard
-                                    }
-                                    if (sim == null || shizukuStatus != ShizukuStatus.READY) {
-                                        featureSwitches[feature] = previousUiValue
-                                        committedFeatureSwitches[feature] = previousCommittedValue
-                                        Toast.makeText(
-                                            context,
-                                            R.string.shizuku_not_running_msg,
-                                            Toast.LENGTH_LONG
-                                        ).show()
-                                        return@FeaturesCard
-                                    }
-                                    scope.launch {
-                                        applyingConfiguration = true
-                                        try {
-                                            val resultMsg = viewModel.onApplyConfiguration(
-                                                sim,
-                                                buildCompleteFeatureMap(committedFeatureSwitches)
-                                            )
-                                            if (resultMsg != null) {
-                                                if ((value.data as? Boolean) == true) {
-                                                    viewModel.appendSwitchFailureLog(
-                                                        action = feature.name,
-                                                        subId = sim.subId.takeIf { it >= 0 },
-                                                        stage = "apply_switch_enable",
-                                                        backendMessage = resultMsg
-                                                    )
-                                                }
-                                                featureSwitches[feature] = previousUiValue
-                                                committedFeatureSwitches[feature] = previousCommittedValue
-                                                Toast.makeText(
-                                                    context,
-                                                    context.getString(R.string.config_failed, resultMsg),
-                                                    Toast.LENGTH_LONG
-                                                ).show()
-                                            }
-                                        } finally {
-                                            applyingConfiguration = false
-                                        }
-                                    }
-                                }
-                            }
-                        },
+                        onFeatureSwitchChange = handleFeatureSwitchChange,
+                        showTikTokFix = false,
                         onTextFeatureCommit = { _ ->
                             scope.launch {
                                 if (applyingConfiguration) return@launch
@@ -845,10 +984,11 @@ class MainActivity : BaseActivity() {
                                 }
                                 applyingConfiguration = true
                                 try {
-                                    val resultMsg = viewModel.onApplyConfiguration(
-                                        sim,
-                                        mapToApply
-                                    )
+                                        val resultMsg = viewModel.onApplyConfiguration(
+                                            sim,
+                                            mapToApply,
+                                            countryMccOverride = countryMccDraftBySubId[sim.subId].orEmpty()
+                                        )
                                     if (resultMsg == null) {
                                         syncFeatureState(committedFeatureSwitches, mapToApply)
                                         countryIsoApplySignalBySubId[sim.subId] =
@@ -989,13 +1129,226 @@ class MainActivity : BaseActivity() {
                         },
                     )
                 }
-                if (issueFailureLogs.isNotBlank()) {
+                if (selectedTab == MainTab.EXTRA) {
+                    ExtraToolsPage(
+                        shizukuStatus = shizukuStatus,
+                        selectedSim = selectedSim,
+                        tiktokEnabled = (featureSwitches[Feature.TIKTOK_NETWORK_FIX]?.data as? Boolean) == true,
+                        featureSwitchesEnabled = !applyingConfiguration,
+                        networkExitChecking = networkExitChecking,
+                        networkExitStatus = networkExitStatus,
+                        networkExitError = networkExitError,
+                        configBackups = configBackups,
+                        onTikTokFixChange = { enabled ->
+                            handleFeatureSwitchChange(
+                                Feature.TIKTOK_NETWORK_FIX,
+                                FeatureValue(enabled, FeatureValueType.BOOLEAN)
+                            )
+                        },
+                        onCheckNetworkExit = {
+                            if (networkExitChecking) return@ExtraToolsPage
+                            scope.launch {
+                                networkExitChecking = true
+                                networkExitError = null
+                                val result = viewModel.checkNetworkExit()
+                                networkExitStatus = result.getOrNull()
+                                networkExitError = result.exceptionOrNull()?.message
+                                networkExitChecking = false
+                            }
+                        },
+                        onOpenApnSettings = {
+                            runCatching {
+                                startActivity(Intent(Settings.ACTION_APN_SETTINGS))
+                            }.onFailure {
+                                Toast.makeText(context, R.string.apn_settings_open_failed, Toast.LENGTH_LONG).show()
+                            }
+                        },
+                        onPrepareApn = {
+                            val sim = selectedSim
+                                if (sim == null || sim.subId < 0) {
+                                    Toast.makeText(context, R.string.select_single_sim, Toast.LENGTH_SHORT).show()
+                                    return@ExtraToolsPage
+                                }
+                            val draft = viewModel.buildSuggestedApnConfig(sim)
+                            val validation = SupportRules.validateApnDraft(draft)
+                            if (validation != null) {
+                                Toast.makeText(
+                                    context,
+                                    context.getString(R.string.apn_draft_invalid, validation),
+                                    Toast.LENGTH_LONG
+                                ).show()
+                                return@ExtraToolsPage
+                            }
+                            apnDraft = draft
+                        },
+                        onBackupConfig = {
+                            val sim = selectedSim
+                            if (sim == null || sim.subId < 0) {
+                                Toast.makeText(context, R.string.select_single_sim, Toast.LENGTH_SHORT).show()
+                                return@ExtraToolsPage
+                            }
+                            viewModel.saveConfigBackup(
+                                selectedSim = sim,
+                                featureMap = buildCompleteFeatureMap(featureSwitches),
+                                name = sim.showTitle,
+                                countryMccOverride = countryMccDraftBySubId[sim.subId].orEmpty(),
+                            )
+                            configBackups = viewModel.loadConfigBackups()
+                            Toast.makeText(context, R.string.config_backup_saved, Toast.LENGTH_SHORT).show()
+                        },
+                        onRestoreBackup = { backup -> restoreBackupAction(backup, false) },
+                        onDeleteBackup = { backup ->
+                            viewModel.deleteConfigBackup(backup.id)
+                            configBackups = viewModel.loadConfigBackups()
+                        },
+                    )
+                }
+                if (selectedTab == MainTab.SUPPORT) {
+                    SupportPage(
+                        supportPaymentConfigured = viewModel.isDodopaySupportConfigured(),
+                        onCreateSupportOrder = supportOrder@{ name, message, amount ->
+                            val result = viewModel.buildDodopaySupportUrl(name, message, amount)
+                            val url = result.getOrNull()
+                            if (url == null) {
+                                Toast.makeText(
+                                    context,
+                                    result.exceptionOrNull()?.message
+                                        ?: context.getString(R.string.support_payment_open_failed),
+                                    Toast.LENGTH_LONG
+                                ).show()
+                                return@supportOrder
+                            }
+                            supportPaymentUrl = url
+                        },
+                    )
+                }
+                if (selectedTab == MainTab.COOPERATION) {
+                    CooperationPage(
+                        adsConfigured = viewModel.isAdServiceConfigured(),
+                        businessIntentConfigured = viewModel.isBusinessIntentConfigured(),
+                        businessIntentSubmitting = submittingBusinessIntent,
+                        cooperationAds = commercialAds.filter { it.placement == AdPlacement.COOPERATION_CARD },
+                        businessContactText = BuildConfig.BUSINESS_CONTACT_TEXT,
+                        businessContactUrl = BuildConfig.BUSINESS_CONTACT_URL,
+                        onOpenAd = { ad ->
+                            if (ad.actionUrl.isNotBlank()) uriHandler.openUri(ad.actionUrl)
+                        },
+                        onSubmitBusinessIntent = { intentType, name, contact, message ->
+                            scope.launch {
+                                submittingBusinessIntent = true
+                                val result = viewModel.submitBusinessIntent(intentType, name, contact, message)
+                                submittingBusinessIntent = false
+                                if (result.isSuccess) {
+                                    Toast.makeText(context, R.string.business_intent_success, Toast.LENGTH_SHORT).show()
+                                } else {
+                                    Toast.makeText(
+                                        context,
+                                        context.getString(
+                                            R.string.business_intent_failed,
+                                            result.exceptionOrNull()?.message ?: "unknown"
+                                        ),
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                }
+                            }
+                        },
+                        onOpenBusinessContact = { url ->
+                            if (url.isNotBlank()) uriHandler.openUri(url)
+                        },
+                    )
+                }
+                if (selectedTab == MainTab.ABOUT && issueFailureLogs.isNotBlank()) {
                     IssueReportHintCard(
                         onSubmitIssue = submitIssueAction
                     )
                 }
                 Spacer(modifier = Modifier.windowInsetsBottomHeight(WindowInsets.navigationBars))
 
+                homeAdToShow?.let { ad ->
+                    CommercialAdDialog(
+                        ad = ad,
+                        onOpen = {
+                            homeAdToShow = null
+                            if (ad.actionUrl.isNotBlank()) uriHandler.openUri(ad.actionUrl)
+                        },
+                        onDismiss = {
+                            viewModel.dismissHomeAd(ad)
+                            homeAdToShow = null
+                        }
+                    )
+                }
+                supportPaymentUrl?.let { url ->
+                    SupportPaymentDialog(
+                        url = url,
+                        onDismiss = { supportPaymentUrl = null },
+                    )
+                }
+                apnDraft?.let { draft ->
+                    ApnConfirmDialog(
+                        draft = draft,
+                        applying = applyingApn,
+                        onDismiss = {
+                            if (!applyingApn) apnDraft = null
+                        },
+                        onConfirm = {
+                            val sim = selectedSim
+                            if (sim == null || sim.subId < 0) {
+                                Toast.makeText(context, R.string.select_single_sim, Toast.LENGTH_SHORT).show()
+                                apnDraft = null
+                                return@ApnConfirmDialog
+                            }
+                            if (shizukuStatus != ShizukuStatus.READY) {
+                                Toast.makeText(context, R.string.shizuku_not_running_msg, Toast.LENGTH_LONG).show()
+                                return@ApnConfirmDialog
+                            }
+                            scope.launch {
+                                applyingApn = true
+                                val resultMsg = viewModel.applyApnConfig(sim, draft)
+                                applyingApn = false
+                                apnDraft = null
+                                Toast.makeText(
+                                    context,
+                                    if (resultMsg == null) {
+                                        context.getString(R.string.apn_apply_success)
+                                    } else {
+                                        context.getString(R.string.apn_apply_failed, resultMsg)
+                                    },
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            }
+                        }
+                    )
+                }
+                pendingBackupRestore?.let { backup ->
+                    AlertDialog(
+                        onDismissRequest = { pendingBackupRestore = null },
+                        title = { Text(stringResource(R.string.config_backup_mismatch_title)) },
+                        text = {
+                            Text(
+                                stringResource(
+                                    R.string.config_backup_mismatch_message,
+                                    "${backup.mcc.ifBlank { "-" }}/${backup.mnc.ifBlank { "-" }}",
+                                    "${selectedSim?.mcc.orEmpty().ifBlank { "-" }}/${selectedSim?.mnc.orEmpty().ifBlank { "-" }}"
+                                )
+                            )
+                        },
+                        confirmButton = {
+                            TextButton(
+                                onClick = {
+                                    pendingBackupRestore = null
+                                    restoreBackupAction(backup, true)
+                                }
+                            ) {
+                                Text(stringResource(R.string.config_backup_restore_anyway))
+                            }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = { pendingBackupRestore = null }) {
+                                Text(stringResource(id = android.R.string.cancel))
+                            }
+                        }
+                    )
+                }
                 if (showShizukuUpdateDialog) {
                     ShizukuUpdateDialog {
                         showShizukuUpdateDialog = false
@@ -1030,83 +1383,6 @@ class MainActivity : BaseActivity() {
                         dismissButton = {
                             TextButton(onClick = { updateDialogState = null }) {
                                 Text(stringResource(id = android.R.string.cancel))
-                            }
-                        }
-                    )
-                }
-                if (showDonationSheet) {
-                    DonationBottomSheet(
-                        onDismissRequest = {
-                            showDonationSheet = false
-                        },
-                        onOpenWeChat = {
-                            val savedQr = saveDonationQrToGallery(
-                                context = context,
-                                imageRes = R.drawable.donate_wechat,
-                                filePrefix = "turboims_wechat",
-                            )
-                            donationFeedbackMessage = if (savedQr == null) {
-                                context.getString(R.string.donation_save_failed)
-                            } else {
-                                val opened = openWeChatDonationPage(context)
-                                if (opened) {
-                                    context.getString(
-                                        R.string.donation_open_wechat_hint_with_path,
-                                        savedQr.path
-                                    )
-                                } else {
-                                    context.getString(R.string.donation_open_wechat_failed)
-                                }
-                            }
-                            showDonationSheet = false
-                            Toast.makeText(context, donationFeedbackMessage, Toast.LENGTH_LONG).show()
-                        },
-                        onOpenAlipay = {
-                            val savedQr = saveDonationQrToGallery(
-                                context = context,
-                                imageRes = R.drawable.donate_alipay,
-                                filePrefix = "turboims_alipay",
-                            )
-                            donationFeedbackMessage = if (savedQr == null) {
-                                context.getString(R.string.donation_save_failed)
-                            } else {
-                                val opened = openAlipayDonationPage(context, savedQr.uri)
-                                if (opened) {
-                                    context.getString(
-                                        R.string.donation_open_alipay_hint_with_path,
-                                        savedQr.path
-                                    )
-                                } else {
-                                    context.getString(R.string.donation_open_alipay_failed)
-                                }
-                            }
-                            showDonationSheet = false
-                            Toast.makeText(context, donationFeedbackMessage, Toast.LENGTH_LONG).show()
-                        },
-                        onSaveImage = { imageRes, filePrefix ->
-                            val savedPath = saveDonationQrToGallery(context, imageRes, filePrefix)
-                            donationFeedbackMessage = if (savedPath != null) {
-                                context.getString(R.string.donation_save_success_with_path, savedPath.path)
-                            } else {
-                                context.getString(R.string.donation_save_failed)
-                            }
-                            showDonationSheet = false
-                            Toast.makeText(context, donationFeedbackMessage, Toast.LENGTH_LONG).show()
-                        },
-                    )
-                }
-                if (donationFeedbackMessage != null) {
-                    AlertDialog(
-                        onDismissRequest = { donationFeedbackMessage = null },
-                        title = {
-                            Text(text = stringResource(R.string.donation_feedback_title))
-                        },
-                        text = {
-                            Text(text = donationFeedbackMessage!!)
-                        },
-                        confirmButton = {
-                            TextButton(onClick = { donationFeedbackMessage = null }) {
-                                Text(stringResource(id = android.R.string.ok))
                             }
                         }
                     )
@@ -1365,6 +1641,916 @@ class MainActivity : BaseActivity() {
     }
 }
 
+@Composable
+private fun HomeStatusCard(
+    shizukuStatus: ShizukuStatus,
+    onRefresh: () -> Unit,
+    onRequestShizukuPermission: () -> Unit,
+) {
+    val shizukuStatusText = when (shizukuStatus) {
+        ShizukuStatus.CHECKING -> stringResource(R.string.shizuku_checking)
+        ShizukuStatus.NOT_RUNNING -> stringResource(R.string.shizuku_not_running)
+        ShizukuStatus.NO_PERMISSION -> stringResource(R.string.shizuku_no_permission)
+        ShizukuStatus.READY -> stringResource(R.string.shizuku_ready)
+        ShizukuStatus.NEED_UPDATE -> stringResource(R.string.update_shizuku)
+    }
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp)
+            .padding(top = 16.dp, bottom = 8.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text(
+                    modifier = Modifier.weight(1f),
+                    text = stringResource(R.string.shizuku_status, shizukuStatusText),
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Medium,
+                )
+                FeatureActionChip(
+                    icon = Icons.Rounded.Cached,
+                    label = stringResource(R.string.refresh_permission),
+                    onClick = onRefresh,
+                )
+            }
+            if (shizukuStatus == ShizukuStatus.NO_PERMISSION) {
+                Button(onClick = onRequestShizukuPermission) {
+                    Text(stringResource(R.string.request_permission))
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ExtraToolsPage(
+    shizukuStatus: ShizukuStatus,
+    selectedSim: SimSelection?,
+    tiktokEnabled: Boolean,
+    featureSwitchesEnabled: Boolean,
+    networkExitChecking: Boolean,
+    networkExitStatus: NetworkExitStatus?,
+    networkExitError: String?,
+    configBackups: List<ConfigBackupSnapshot>,
+    onTikTokFixChange: (Boolean) -> Unit,
+    onCheckNetworkExit: () -> Unit,
+    onOpenApnSettings: () -> Unit,
+    onPrepareApn: () -> Unit,
+    onBackupConfig: () -> Unit,
+    onRestoreBackup: (ConfigBackupSnapshot) -> Unit,
+    onDeleteBackup: (ConfigBackupSnapshot) -> Unit,
+) {
+    val isDomestic = isChinaDomesticSim(selectedSim)
+    if (shizukuStatus != ShizukuStatus.READY) {
+        SimpleMessageCard(
+            title = stringResource(R.string.extra_requires_shizuku_title),
+            body = stringResource(R.string.captive_portal_fix_requires_shizuku)
+        )
+    }
+    RegionCompatibilityCard(
+        selectedSim = selectedSim,
+        isDomestic = isDomestic,
+    )
+    TiktokFixCard(
+        enabled = tiktokEnabled,
+        available = isDomestic,
+        switchEnabled = featureSwitchesEnabled && (selectedSim?.subId ?: -1) >= 0,
+        onCheckedChange = onTikTokFixChange,
+    )
+    NetworkExitCard(
+        checking = networkExitChecking,
+        status = networkExitStatus,
+        error = networkExitError,
+        onCheck = onCheckNetworkExit,
+    )
+    ApnSimInfoCard(
+        selectedSim = selectedSim,
+        onOpenApnSettings = onOpenApnSettings,
+        onPrepareApn = onPrepareApn,
+    )
+    QuickSettingsGuideCard()
+    ConfigBackupCard(
+        backups = configBackups,
+        onBackupConfig = onBackupConfig,
+        onRestoreBackup = onRestoreBackup,
+        onDeleteBackup = onDeleteBackup,
+    )
+}
+
+@Composable
+private fun RegionCompatibilityCard(
+    selectedSim: SimSelection?,
+    isDomestic: Boolean,
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp)
+            .padding(bottom = 16.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text(
+                text = stringResource(R.string.region_compat_title),
+                fontSize = 16.sp,
+                fontWeight = FontWeight.SemiBold,
+            )
+            val sim = selectedSim
+            if (sim == null || sim.subId < 0) {
+                Text(
+                    text = stringResource(R.string.select_single_sim),
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.outline,
+                )
+                return@Column
+            }
+            KeyValueRow("MCC/MNC", "${sim.mcc.ifBlank { "-" }}/${sim.mnc.ifBlank { "-" }}")
+            KeyValueRow("ISO", sim.countryIso.ifBlank { "-" })
+            KeyValueRow(
+                stringResource(R.string.region_mainland_sim),
+                stringResource(if (isDomestic) R.string.region_status_yes else R.string.region_status_no),
+            )
+            KeyValueRow(
+                stringResource(R.string.region_tiktok_applicable),
+                stringResource(
+                    if (isDomestic) {
+                        R.string.region_status_applicable
+                    } else {
+                        R.string.region_status_not_applicable
+                    }
+                ),
+            )
+        }
+    }
+}
+
+@Composable
+private fun TiktokFixCard(
+    enabled: Boolean,
+    available: Boolean,
+    switchEnabled: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp)
+            .padding(bottom = 16.dp)
+    ) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            BooleanFeatureItem(
+                title = stringResource(R.string.tiktok_network_fix),
+                description = if (available) {
+                    stringResource(R.string.tiktok_network_fix_desc)
+                } else {
+                    stringResource(R.string.tiktok_network_fix_unavailable)
+                },
+                checked = enabled && available,
+                enabled = switchEnabled && available,
+                onCheckedChange = onCheckedChange,
+            )
+        }
+    }
+}
+
+@Composable
+private fun NetworkExitCard(
+    checking: Boolean,
+    status: NetworkExitStatus?,
+    error: String?,
+    onCheck: () -> Unit,
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp)
+            .padding(bottom = 16.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text(
+                text = stringResource(R.string.network_exit_title),
+                fontSize = 16.sp,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Text(
+                text = stringResource(R.string.network_exit_desc),
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.outline,
+            )
+            Button(
+                onClick = onCheck,
+                enabled = !checking,
+                modifier = Modifier.height(40.dp)
+            ) {
+                Text(stringResource(if (checking) R.string.network_exit_checking else R.string.network_exit_action))
+            }
+            if (checking) {
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+            }
+            if (error != null) {
+                Text(text = stringResource(R.string.network_exit_failed, error), color = MaterialTheme.colorScheme.error)
+            }
+            status?.let {
+                KeyValueRow(stringResource(R.string.network_exit_ip), "${it.ip} · ${it.ipVersion}")
+                KeyValueRow(stringResource(R.string.network_exit_region), listOf(it.country, it.region, it.city).filter { text -> text.isNotBlank() }.joinToString(" / "))
+                KeyValueRow(stringResource(R.string.network_exit_org), it.org)
+                KeyValueRow(stringResource(R.string.network_exit_risk), it.risk)
+                KeyValueRow(stringResource(R.string.network_exit_services), serviceSummary(it))
+            }
+        }
+    }
+}
+
+@Composable
+private fun ApnSimInfoCard(
+    selectedSim: SimSelection?,
+    onOpenApnSettings: () -> Unit,
+    onPrepareApn: () -> Unit,
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp)
+            .padding(bottom = 16.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text(
+                text = stringResource(R.string.apn_sim_title),
+                fontSize = 16.sp,
+                fontWeight = FontWeight.SemiBold,
+            )
+            val sim = selectedSim
+            if (sim == null || sim.subId < 0) {
+                Text(
+                    text = stringResource(R.string.select_single_sim),
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.outline
+                )
+            } else {
+                KeyValueRow(stringResource(R.string.sim_card), sim.showTitle)
+                KeyValueRow("MCC/MNC", "${sim.mcc.ifBlank { "-" }}/${sim.mnc.ifBlank { "-" }}")
+                KeyValueRow("ISO", sim.countryIso.ifBlank { "-" })
+                KeyValueRow("ICCID", sim.iccId.takeLast(4).ifBlank { "----" })
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = onOpenApnSettings, modifier = Modifier.height(40.dp)) {
+                    Text(stringResource(R.string.open_apn_settings))
+                }
+                Button(
+                    onClick = onPrepareApn,
+                    enabled = selectedSim != null && selectedSim.subId >= 0,
+                    modifier = Modifier.height(40.dp)
+                ) {
+                    Text(stringResource(R.string.apn_auto_apply))
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun QuickSettingsGuideCard() {
+    SimpleMessageCard(
+        title = stringResource(R.string.qs_guide_title),
+        body = stringResource(R.string.qs_guide_desc)
+    )
+}
+
+@Composable
+private fun ConfigBackupCard(
+    backups: List<ConfigBackupSnapshot>,
+    onBackupConfig: () -> Unit,
+    onRestoreBackup: (ConfigBackupSnapshot) -> Unit,
+    onDeleteBackup: (ConfigBackupSnapshot) -> Unit,
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp)
+            .padding(bottom = 16.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = stringResource(R.string.config_backup_title),
+                    modifier = Modifier.weight(1f),
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Button(onClick = onBackupConfig, modifier = Modifier.height(40.dp)) {
+                    Text(stringResource(R.string.config_backup_action))
+                }
+            }
+            if (backups.isEmpty()) {
+                Text(
+                    text = stringResource(R.string.config_backup_empty),
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.outline
+                )
+            } else {
+                backups.forEach { backup ->
+                    HorizontalDivider(thickness = 0.5.dp)
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(backup.name, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                            Text(
+                                text = backupSubtitle(backup),
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.outline
+                            )
+                        }
+                        TextButton(onClick = { onRestoreBackup(backup) }) {
+                            Text(stringResource(R.string.config_backup_restore))
+                        }
+                        TextButton(onClick = { onDeleteBackup(backup) }) {
+                            Text(stringResource(R.string.config_backup_delete))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SupportPage(
+    supportPaymentConfigured: Boolean,
+    onCreateSupportOrder: (String, String, String) -> Unit,
+) {
+    var name by remember { mutableStateOf("") }
+    var message by remember { mutableStateOf("") }
+    var amount by remember { mutableStateOf("9.90") }
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(16.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Text(stringResource(R.string.support_message_title), fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+            if (!supportPaymentConfigured) {
+                Text(
+                    text = stringResource(R.string.support_payment_not_configured),
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.outline,
+                )
+            }
+            OutlinedTextField(
+                value = name,
+                onValueChange = { name = it.take(24) },
+                label = { Text(stringResource(R.string.support_name_label)) },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = message,
+                onValueChange = { message = it.take(120) },
+                label = { Text(stringResource(R.string.support_message_label)) },
+                modifier = Modifier.fillMaxWidth(),
+                minLines = 2,
+                maxLines = 4,
+            )
+            OutlinedTextField(
+                value = amount,
+                onValueChange = { raw -> amount = raw.filter { it.isDigit() || it == '.' }.take(8) },
+                label = { Text(stringResource(R.string.support_amount_label)) },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Button(
+                onClick = { onCreateSupportOrder(name, message, amount) },
+                enabled = supportPaymentConfigured && SupportRules.normalizeSupportAmount(amount) != null,
+                modifier = Modifier.height(44.dp)
+            ) {
+                Text(stringResource(R.string.support_go_pay))
+            }
+        }
+    }
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp)
+            .padding(bottom = 16.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Text(
+                text = stringResource(R.string.support_records_title),
+                fontSize = 16.sp,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Text(
+                text = stringResource(R.string.support_records_dodopay_note),
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.outline
+            )
+        }
+    }
+}
+
+@Composable
+private fun CooperationPage(
+    adsConfigured: Boolean,
+    businessIntentConfigured: Boolean,
+    businessIntentSubmitting: Boolean,
+    cooperationAds: List<CommercialAd>,
+    businessContactText: String,
+    businessContactUrl: String,
+    onOpenAd: (CommercialAd) -> Unit,
+    onSubmitBusinessIntent: (BusinessIntentType, String, String, String) -> Unit,
+    onOpenBusinessContact: (String) -> Unit,
+) {
+    var businessIntentType by remember { mutableStateOf(BusinessIntentType.ADS) }
+    var businessName by remember { mutableStateOf("") }
+    var businessContact by remember { mutableStateOf("") }
+    var businessMessage by remember { mutableStateOf("") }
+
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(16.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text(stringResource(R.string.business_contact_title), fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+            Text(stringResource(R.string.business_contact_desc), fontSize = 12.sp, color = MaterialTheme.colorScheme.outline)
+            if (!businessIntentConfigured) {
+                Text(
+                    text = stringResource(R.string.business_intent_not_configured),
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.outline,
+                )
+            }
+            OutlinedTextField(
+                value = businessName,
+                onValueChange = { businessName = it.take(40) },
+                label = { Text(stringResource(R.string.business_name_label)) },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = businessContact,
+                onValueChange = { businessContact = it.take(120) },
+                label = { Text(stringResource(R.string.business_contact_label)) },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            BusinessIntentTypeField(
+                value = businessIntentType,
+                onValueChange = { businessIntentType = it },
+            )
+            OutlinedTextField(
+                value = businessMessage,
+                onValueChange = { businessMessage = it.take(500) },
+                label = { Text(stringResource(R.string.business_message_label)) },
+                modifier = Modifier.fillMaxWidth(),
+                minLines = 2,
+                maxLines = 4,
+            )
+            Button(
+                onClick = {
+                    onSubmitBusinessIntent(
+                        businessIntentType,
+                        businessName,
+                        businessContact,
+                        businessMessage
+                    )
+                },
+                enabled = businessIntentConfigured &&
+                    !businessIntentSubmitting &&
+                    businessContact.isNotBlank() &&
+                    businessMessage.isNotBlank(),
+                modifier = Modifier.height(44.dp)
+            ) {
+                Text(
+                    stringResource(
+                        if (businessIntentSubmitting) {
+                            R.string.business_intent_submitting
+                        } else {
+                            R.string.business_intent_submit
+                        }
+                    )
+                )
+            }
+            if (!businessIntentConfigured && businessContactText.isNotBlank()) {
+                Text(
+                    text = businessContactText,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Medium,
+                )
+            }
+            if (!businessIntentConfigured && businessContactUrl.isNotBlank()) {
+                TextButton(onClick = { onOpenBusinessContact(businessContactUrl) }) {
+                    Text(stringResource(R.string.business_contact_action))
+                }
+            }
+            if (!adsConfigured) {
+                Text(stringResource(R.string.ads_service_not_configured), fontSize = 12.sp, color = MaterialTheme.colorScheme.outline)
+            }
+            cooperationAds.forEach { ad ->
+                CommercialAdInlineCard(ad = ad, onOpen = { onOpenAd(ad) })
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun BusinessIntentTypeField(
+    value: BusinessIntentType,
+    onValueChange: (BusinessIntentType) -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    ExposedDropdownMenuBox(
+        expanded = expanded,
+        onExpandedChange = { expanded = !expanded },
+    ) {
+        OutlinedTextField(
+            modifier = Modifier
+                .fillMaxWidth()
+                .menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable),
+            value = businessIntentTypeText(value),
+            onValueChange = {},
+            readOnly = true,
+            singleLine = true,
+            label = { Text(stringResource(R.string.business_type_label)) },
+            trailingIcon = {
+                ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded)
+            },
+        )
+        ExposedDropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false },
+        ) {
+            BusinessIntentType.entries.forEach { type ->
+                DropdownMenuItem(
+                    text = { Text(businessIntentTypeText(type)) },
+                    onClick = {
+                        expanded = false
+                        onValueChange(type)
+                    },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun businessIntentTypeText(type: BusinessIntentType): String {
+    return stringResource(
+        when (type) {
+            BusinessIntentType.ADS -> R.string.business_type_ads
+            BusinessIntentType.DEVELOPMENT -> R.string.business_type_development
+            BusinessIntentType.TOKEN_SUPPLY -> R.string.business_type_token_supply
+            BusinessIntentType.OTHER -> R.string.business_type_other
+        }
+    )
+}
+
+@Composable
+private fun CommercialAdInlineCard(
+    ad: CommercialAd,
+    onOpen: () -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(MaterialTheme.colorScheme.surfaceContainerHighest)
+            .clickable(enabled = ad.actionUrl.isNotBlank(), onClick = onOpen)
+            .padding(10.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        if (ad.imageUrl.isNotBlank()) {
+            RemoteAdImage(
+                ad = ad,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 180.dp)
+                    .clip(RoundedCornerShape(8.dp))
+            )
+        }
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                if (ad.title.isNotBlank()) {
+                    Text(ad.title, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                }
+                if (ad.body.isNotBlank()) {
+                    Text(ad.body, fontSize = 12.sp, color = MaterialTheme.colorScheme.outline)
+                }
+            }
+            if (ad.actionUrl.isNotBlank()) {
+                Text(ad.actionLabel, fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
+            }
+        }
+    }
+}
+
+@Composable
+private fun RemoteAdImage(
+    ad: CommercialAd,
+    modifier: Modifier = Modifier,
+) {
+    val state by produceState<RemoteAdImageState>(
+        initialValue = RemoteAdImageState.Loading,
+        key1 = ad.imageUrl,
+    ) {
+        value = loadRemoteAdImage(ad.imageUrl)?.let(RemoteAdImageState::Ready)
+            ?: RemoteAdImageState.Failed
+    }
+    when (val current = state) {
+        RemoteAdImageState.Loading -> {
+            Box(
+                modifier = modifier
+                    .height(120.dp)
+                    .background(MaterialTheme.colorScheme.surfaceContainer),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = stringResource(R.string.ad_image_loading),
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.outline,
+                )
+            }
+        }
+
+        RemoteAdImageState.Failed -> {
+            Box(
+                modifier = modifier
+                    .height(120.dp)
+                    .background(MaterialTheme.colorScheme.surfaceContainer),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = stringResource(R.string.ad_image_failed),
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.outline,
+                )
+            }
+        }
+
+        is RemoteAdImageState.Ready -> {
+            Image(
+                bitmap = current.bitmap.asImageBitmap(),
+                contentDescription = ad.altText.ifBlank { ad.title },
+                contentScale = ad.imageContentScale(),
+                modifier = modifier,
+            )
+        }
+    }
+}
+
+private suspend fun loadRemoteAdImage(imageUrl: String): Bitmap? = withContext(Dispatchers.IO) {
+    if (imageUrl.isBlank()) return@withContext null
+    val connection = (URL(imageUrl).openConnection() as HttpURLConnection).apply {
+        connectTimeout = 4_000
+        readTimeout = 4_000
+        instanceFollowRedirects = true
+    }
+    try {
+        if (connection.responseCode !in 200..299) return@withContext null
+        connection.inputStream.use { input ->
+            BitmapFactory.decodeStream(input)
+        }
+    } catch (_: Throwable) {
+        null
+    } finally {
+        connection.disconnect()
+    }
+}
+
+private fun CommercialAd.imageContentScale(): ContentScale {
+    return when (imageFit.lowercase(Locale.US)) {
+        "cover" -> ContentScale.Crop
+        "fill" -> ContentScale.FillBounds
+        else -> ContentScale.Fit
+    }
+}
+
+@Composable
+private fun CommercialAdDialog(
+    ad: CommercialAd,
+    onOpen: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Card(
+            modifier = Modifier.fillMaxWidth(0.96f),
+            shape = RoundedCornerShape(18.dp),
+        ) {
+            Column(
+                modifier = Modifier.padding(10.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                if (ad.imageUrl.isNotBlank()) {
+                    RemoteAdImage(
+                        ad = ad,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 640.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                    )
+                }
+                if (ad.title.isNotBlank() || ad.body.isNotBlank()) {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        if (ad.title.isNotBlank()) {
+                            Text(ad.title, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                        if (ad.body.isNotBlank()) {
+                            Text(ad.body, fontSize = 12.sp, color = MaterialTheme.colorScheme.outline)
+                        }
+                    }
+                }
+                Text(
+                    text = stringResource(R.string.home_ad_disclosure),
+                    fontSize = 12.sp,
+                    lineHeight = 17.sp,
+                    color = MaterialTheme.colorScheme.outline,
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    TextButton(onClick = onDismiss) {
+                        Text(stringResource(id = android.R.string.cancel))
+                    }
+                    if (ad.actionUrl.isNotBlank()) {
+                        TextButton(onClick = onOpen) {
+                            Text(ad.actionLabel.ifBlank { stringResource(R.string.action_open) })
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@SuppressLint("SetJavaScriptEnabled")
+@Composable
+private fun SupportPaymentDialog(
+    url: String,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        modifier = Modifier.fillMaxWidth(0.96f),
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.support_payment_page_title)) },
+        text = {
+            AndroidView(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(620.dp)
+                    .clip(RoundedCornerShape(12.dp)),
+                factory = { context ->
+                    WebView(context).apply {
+                        webViewClient = object : WebViewClient() {
+                            override fun shouldOverrideUrlLoading(
+                                view: WebView?,
+                                request: WebResourceRequest?,
+                            ): Boolean {
+                                val nextUrl = request?.url?.toString().orEmpty()
+                                if (SupportRules.isDodopayCheckoutCloseUrl(nextUrl)) {
+                                    onDismiss()
+                                    return true
+                                }
+                                return false
+                            }
+                        }
+                        settings.javaScriptEnabled = true
+                        settings.domStorageEnabled = true
+                        settings.loadWithOverviewMode = true
+                        settings.useWideViewPort = true
+                        loadUrl(url)
+                    }
+                },
+                update = {},
+            )
+        },
+        confirmButton = {},
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text(stringResource(id = android.R.string.cancel))
+            }
+        },
+    )
+}
+
+@Composable
+private fun ApnConfirmDialog(
+    draft: ApnDraftConfig,
+    applying: Boolean,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.apn_confirm_title)) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                KeyValueRow(stringResource(R.string.apn_name), draft.name)
+                KeyValueRow("APN", draft.apn)
+                KeyValueRow(stringResource(R.string.apn_type), draft.type)
+                KeyValueRow("MCC/MNC", "${draft.mcc}/${draft.mnc}")
+                if (applying) {
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm, enabled = !applying) {
+                Text(stringResource(R.string.apn_confirm_apply))
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss, enabled = !applying) {
+                Text(stringResource(id = android.R.string.cancel))
+            }
+        }
+    )
+}
+
+@Composable
+private fun SimpleMessageCard(
+    title: String,
+    body: String,
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp)
+            .padding(bottom = 16.dp)
+    ) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Text(title, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(body, fontSize = 12.sp, color = MaterialTheme.colorScheme.outline)
+        }
+    }
+}
+
+@Composable
+private fun KeyValueRow(
+    label: String,
+    value: String,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Text(label, modifier = Modifier.width(82.dp), fontSize = 12.sp, color = MaterialTheme.colorScheme.outline)
+        Text(value.ifBlank { "-" }, modifier = Modifier.weight(1f), fontSize = 12.sp)
+    }
+}
+
+private fun serviceSummary(status: NetworkExitStatus): String {
+    fun flag(value: Boolean?): String = when (value) {
+        true -> "OK"
+        false -> "FAIL"
+        null -> "N/A"
+    }
+    return "Google ${flag(status.googleReachable)} · TikTok ${flag(status.tiktokReachable)} · 验证 ${flag(status.captivePortalReachable)}"
+}
+
+private fun backupSubtitle(backup: ConfigBackupSnapshot): String {
+    val time = SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()).format(Date(backup.createdAtMillis))
+    return "$time · MCC/MNC ${backup.mcc.ifBlank { "-" }}/${backup.mnc.ifBlank { "-" }}"
+}
+
 /**
  *系统信息卡片
  * 显示软件版本、Android 版本、Shizuku 状态等。
@@ -1382,6 +2568,7 @@ fun SystemInfoCard(
     onLogcatClick: () -> Unit,
     onIssueClick: () -> Unit,
     onDonateClick: () -> Unit,
+    showDonateButton: Boolean = true,
 ) {
     val uriHandler = LocalUriHandler.current
     val shizukuStatusText = when (shizukuStatus) {
@@ -1510,24 +2697,26 @@ fun SystemInfoCard(
                     Text(text = stringResource(id = R.string.request_permission))
                 }
             }
-            Spacer(modifier = Modifier.height(8.dp))
-            HorizontalDivider(thickness = 0.5.dp)
-            Spacer(modifier = Modifier.height(8.dp))
-            Button(
-                onClick = onDonateClick,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(44.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = MaterialTheme.colorScheme.tertiaryContainer,
-                    contentColor = MaterialTheme.colorScheme.onTertiaryContainer
-                )
-            ) {
-                Text(
-                    text = stringResource(R.string.donation_action),
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.SemiBold
-                )
+            if (showDonateButton) {
+                Spacer(modifier = Modifier.height(8.dp))
+                HorizontalDivider(thickness = 0.5.dp)
+                Spacer(modifier = Modifier.height(8.dp))
+                Button(
+                    onClick = onDonateClick,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(44.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.tertiaryContainer,
+                        contentColor = MaterialTheme.colorScheme.onTertiaryContainer
+                    )
+                ) {
+                    Text(
+                        text = stringResource(R.string.donation_action),
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
             }
         }
     }
@@ -1760,6 +2949,7 @@ fun FeaturesCard(
     resetFeatures: () -> Unit,
     onDumpConfig: () -> Unit,
     onRunDiagnostics: () -> Unit,
+    showTikTokFix: Boolean = true,
 ) {
     Card(
         modifier = Modifier
@@ -1847,7 +3037,7 @@ fun FeaturesCard(
 
             val showFeatures = Feature.entries.toMutableList().apply {
                 removeAll { it.valueType == FeatureValueType.STRING }
-                if (isSelectAllSim || !isChinaDomesticSim(selectedSim)) {
+                if (!showTikTokFix || isSelectAllSim || !isChinaDomesticSim(selectedSim)) {
                     remove(Feature.TIKTOK_NETWORK_FIX)
                 }
             }
@@ -2167,108 +3357,6 @@ private fun countryIsoMenuItemText(
     option: CountryIsoOption,
 ): String {
     return countryIsoOptionText(option)
-}
-
-private fun saveDonationQrToGallery(
-    context: Context,
-    @DrawableRes imageRes: Int,
-    filePrefix: String,
-): SavedDonationQr? {
-    val bitmap = BitmapFactory.decodeResource(context.resources, imageRes) ?: return null
-    val resolver = context.contentResolver
-    val displayName = "${filePrefix}_${System.currentTimeMillis()}.png"
-    val relativePath = "${Environment.DIRECTORY_DCIM}/TurboIMS"
-    val values = ContentValues().apply {
-        put(MediaStore.Images.Media.DISPLAY_NAME, displayName)
-        put(MediaStore.Images.Media.MIME_TYPE, "image/png")
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            put(MediaStore.Images.Media.RELATIVE_PATH, relativePath)
-            put(MediaStore.Images.Media.IS_PENDING, 1)
-        }
-    }
-    val imageUri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: run {
-        bitmap.recycle()
-        return null
-    }
-    return runCatching {
-        resolver.openOutputStream(imageUri)?.use { output ->
-            check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, output))
-        } ?: error("openOutputStream failed")
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            val publishValues = ContentValues().apply {
-                put(MediaStore.Images.Media.IS_PENDING, 0)
-            }
-            resolver.update(imageUri, publishValues, null, null)
-        }
-        val displayPath = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            "$relativePath/$displayName"
-        } else {
-            "/sdcard/$relativePath/$displayName"
-        }
-        SavedDonationQr(uri = imageUri, path = displayPath)
-    }.getOrElse {
-        resolver.delete(imageUri, null, null)
-        null
-    }.also {
-        bitmap.recycle()
-    }
-}
-
-private fun openAlipayDonationPage(context: Context, donationQrUri: Uri): Boolean {
-    val qrClipData = ClipData.newRawUri("turboims_alipay_qr", donationQrUri)
-    val intents = listOf(
-        Intent(
-            Intent.ACTION_VIEW,
-            "alipays://platformapi/startapp?saId=10000007&qrcode=${Uri.encode(ALIPAY_DONATION_URL)}".toUri()
-        ).setPackage(ALIPAY_PACKAGE_NAME),
-        Intent(Intent.ACTION_VIEW, ALIPAY_DONATION_URL.toUri()).setPackage(ALIPAY_PACKAGE_NAME),
-        Intent(Intent.ACTION_VIEW, ALIPAY_DONATION_URL.toUri()),
-        Intent(Intent.ACTION_VIEW)
-            .setClassName(ALIPAY_PACKAGE_NAME, ALIPAY_SCAN_QR_ACTIVITY)
-            .setDataAndType(donationQrUri, DONATION_QR_MIME_TYPE)
-            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            .apply { clipData = qrClipData },
-        Intent(Intent.ACTION_SEND)
-            .setClassName(ALIPAY_PACKAGE_NAME, ALIPAY_SCAN_QR_ACTIVITY)
-            .setType(DONATION_QR_MIME_TYPE)
-            .putExtra(Intent.EXTRA_STREAM, donationQrUri)
-            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            .apply { clipData = qrClipData },
-    )
-    return startDonationIntentCandidates(context, intents)
-}
-
-private fun openWeChatDonationPage(context: Context): Boolean {
-    val launchIntent = context.packageManager
-        .getLaunchIntentForPackage(WECHAT_PACKAGE_NAME)
-        ?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-    if (launchIntent != null) {
-        return runCatching {
-            context.startActivity(launchIntent)
-            true
-        }.getOrElse { false }
-    }
-    return false
-}
-
-private fun startDonationIntentCandidates(context: Context, intents: List<Intent>): Boolean {
-    intents.forEach { intent ->
-        val launchIntent = intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        val resolved = runCatching {
-            context.packageManager.resolveActivity(launchIntent, 0)
-        }.getOrNull()
-        if (resolved == null) {
-            return@forEach
-        }
-        val started = runCatching {
-            context.startActivity(launchIntent)
-            true
-        }.getOrElse { false }
-        if (started) {
-            return true
-        }
-    }
-    return false
 }
 
 @Composable
@@ -2627,112 +3715,6 @@ private fun IssueReportHintCard(
             ) {
                 Text(text = stringResource(R.string.issue_failure_submit))
             }
-        }
-    }
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun DonationBottomSheet(
-    onDismissRequest: () -> Unit,
-    onOpenWeChat: () -> Unit,
-    onOpenAlipay: () -> Unit,
-    onSaveImage: (Int, String) -> Unit,
-) {
-    ModalBottomSheet(onDismissRequest = onDismissRequest) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 16.dp)
-        ) {
-            Text(
-                text = stringResource(R.string.donation_sheet_title),
-                fontSize = 18.sp,
-                fontWeight = FontWeight.SemiBold,
-            )
-            Spacer(modifier = Modifier.height(8.dp))
-            Text(
-                text = stringResource(R.string.donation_sheet_desc),
-                fontSize = 13.sp,
-                color = MaterialTheme.colorScheme.outline
-            )
-            Spacer(modifier = Modifier.height(12.dp))
-            DonationQrCard(
-                label = stringResource(R.string.donation_wechat),
-                imageRes = R.drawable.donate_wechat,
-                onPayClick = onOpenWeChat,
-                onSaveImage = {
-                    onSaveImage(R.drawable.donate_wechat, "turboims_wechat")
-                }
-            )
-            Spacer(modifier = Modifier.height(10.dp))
-            DonationQrCard(
-                label = stringResource(R.string.donation_alipay),
-                imageRes = R.drawable.donate_alipay,
-                onPayClick = onOpenAlipay,
-                onSaveImage = {
-                    onSaveImage(R.drawable.donate_alipay, "turboims_alipay")
-                }
-            )
-            Spacer(modifier = Modifier.height(20.dp))
-        }
-    }
-}
-
-@Composable
-private fun DonationQrCard(
-    label: String,
-    imageRes: Int,
-    onPayClick: () -> Unit,
-    onSaveImage: () -> Unit,
-) {
-    Card(modifier = Modifier.fillMaxWidth()) {
-        Column(modifier = Modifier.padding(12.dp)) {
-            Text(
-                text = label,
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Medium,
-            )
-            Spacer(modifier = Modifier.height(8.dp))
-            Image(
-                painter = painterResource(imageRes),
-                contentDescription = label,
-                contentScale = ContentScale.Fit,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(max = 280.dp)
-                    .clip(RoundedCornerShape(10.dp))
-                    .clickable(onClick = onSaveImage)
-            )
-            Spacer(modifier = Modifier.height(6.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Button(
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(40.dp),
-                    onClick = onPayClick,
-                ) {
-                    Text(text = stringResource(R.string.donation_pay_now))
-                }
-                Button(
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(40.dp),
-                    onClick = onSaveImage,
-                ) {
-                    Text(text = stringResource(R.string.donation_save_button))
-                }
-            }
-            Text(
-                text = stringResource(R.string.donation_save_tip),
-                fontSize = 11.sp,
-                color = MaterialTheme.colorScheme.outline
-            )
         }
     }
 }
